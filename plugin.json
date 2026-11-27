@@ -1,0 +1,57 @@
+{
+  "id": "harness-antigravity",
+  "name": "Antigravity",
+  "description": "Official Antigravity CLI (ACP) harness plugin for Bazaar Compute Node",
+  "kind": "harness",
+  "version": "0.4.0-rc.1",
+  "apiVersion": 1,
+  "minHostVersion": "0.4.0-rc.1",
+  "license": "Apache-2.0",
+  "main": "index.lua",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "description": "Optional Antigravity model ID override",
+        "x-inspect": "models"
+      },
+      "effort": {
+        "type": "string",
+        "title": "Thought Level / Effort",
+        "description": "Optional thinking effort override",
+        "x-inspect": "efforts"
+      },
+      "apiKey": {
+        "type": "string",
+        "title": "API Key",
+        "description": "Optional GEMINI_API_KEY override",
+        "writeOnly": true
+      },
+      "startupTimeoutSec": {
+        "type": "integer",
+        "title": "Startup Timeout (seconds)",
+        "description": "Optional startup and inspection timeout in seconds",
+        "default": 60
+      },
+      "shutdownTimeoutSec": {
+        "type": "integer",
+        "title": "Shutdown Timeout (seconds)",
+        "description": "Optional graceful session shutdown timeout in seconds",
+        "default": 5
+      }
+    }
+  },
+  "capabilities": [
+    "inspect",
+    "steer",
+    "approval",
+    "background_check"
+  ],
+  "permissions": {
+    "exec": ["agy"],
+    "fsRead": ["~/.gemini/antigravity-cli", "~/.gemini"]
+  }
+}
