@@ -730,12 +730,138 @@ local function hasLiveDiskBackgroundWork(sessionId, subagentCallIds, profileRoot
   return busy == true
 end
 
+local function resolveProfileRoot(env)
+  if type(env) == "table" then
+    local home = trim(env.HOME)
+    if home == "" then
+      home = trim(env.USERPROFILE)
+    end
+    if home ~= "" then
+      return home:gsub("[\\/]+$", "") .. "/.gemini/antigravity-cli"
+    end
+  end
+  return DEFAULT_PROFILE_ROOT
+end
+
+local function parseApiError(text)
+  local status, message, code = text:match("Error (%d%d%d), Message: (.-), Status: ([A-Z_]+)")
+  if status and message and code then
+    return status, message, code
+  end
+  local stCode, httpCode, msg = text:match("([A-Z_]+) %(code (%d%d%d)%): ([^\0-\31\127]+)")
+  if stCode and httpCode and msg then
+    return httpCode, msg, stCode
+  end
+  return nil
+end
+
+local function extractResetHint(text)
+  local ts = text:match("quotaResetTimeStamp:([^%s%]]+)")
+  if ts and ts ~= "" then
+    return "Resets at " .. ts .. "."
+  end
+  local delay = text:match("quotaResetDelay:([0-9%.a-zA-Zµμ]+)")
+  if delay and delay ~= "" then
+    return "Resets in " .. delay .. "."
+  end
+  local retry = text:match("retryDelay:([0-9%.a-zA-Zµμ]+)")
+  if retry and retry ~= "" then
+    return "Retry after " .. retry .. "."
+  end
+  return nil
+end
+
+-- Classify error text from trailing ACP error chunks or Antigravity error steps
+-- (0.3 parity with bazaar_contrib_antigravity/state.py:classify_step_error).
+local function classifyErrorText(rawText)
+  local text = tostring(rawText or "")
+  if text:find("messages%.%d+%.content%.%d+%.thinking%.signature: Field required")
+    or text:find("messages%.%d+%.content%.%d+: Invalid `signature` in `thinking` block")
+    or text:find("INVALID_THINKING_SIGNATURE", 1, true)
+  then
+    return {
+      message = "Antigravity's saved conversation has an invalid thinking signature and can no longer be sent to the model. The next turn will start a fresh Antigravity session.",
+      code = "INVALID_THINKING_SIGNATURE",
+      sessionBroken = true,
+    }
+  end
+
+  local httpStatus, rawMessage, status = parseApiError(text)
+  local quotaExhausted = text:find("reason:QUOTA_EXHAUSTED", 1, true) ~= nil
+    or text:find("QUOTA_EXHAUSTED", 1, true) ~= nil
+
+  if httpStatus then
+    local message = trim(rawMessage)
+    if message == "" then
+      message = "Antigravity API error (" .. httpStatus .. ")."
+    end
+    if quotaExhausted and not message:lower():find("reset", 1, true) then
+      local hint = extractResetHint(text)
+      if hint then
+        message = message:gsub("%.+$", "") .. " (" .. hint .. ")"
+      end
+    end
+    local code = (status ~= "" and status) or (quotaExhausted and "QUOTA_EXHAUSTED" or httpStatus)
+    return {
+      message = message,
+      code = code,
+      sessionBroken = false,
+    }
+  end
+
+  if quotaExhausted then
+    local message = "You have reached your Antigravity quota for this period."
+    local hint = extractResetHint(text)
+    if hint then
+      message = message .. " " .. hint
+    end
+    return {
+      message = message,
+      code = "QUOTA_EXHAUSTED",
+      sessionBroken = false,
+    }
+  end
+
+  local cleaned = trim(text)
+  return {
+    message = cleaned ~= "" and cleaned or "Antigravity stopped this turn because of an error.",
+    code = nil,
+    sessionBroken = false,
+  }
+end
+
+local function readLastTranscriptError(sessionId, profileRoot)
+  if profileRoot == nil then
+    profileRoot = DEFAULT_PROFILE_ROOT
+  end
+  local validId = validSessionId(sessionId)
+  if not validId then
+    return nil
+  end
+  local step = readLastTranscriptStep(profileRoot, validId)
+  if not step then
+    return nil
+  end
+  local stype = tostring(step.type or "")
+  if stype == "ERROR" or stype == "ERROR_MESSAGE" or stype == "CORTEX_STEP_TYPE_ERROR_MESSAGE" then
+    local content = type(step.content) == "string" and step.content
+      or (type(step.error) == "string" and step.error)
+      or (type(step.message) == "string" and step.message)
+      or ""
+    return classifyErrorText(content)
+  end
+  return nil
+end
+
 return {
   DEFAULT_PROFILE_ROOT = DEFAULT_PROFILE_ROOT,
   MAX_JSON_FILE_BYTES = MAX_JSON_FILE_BYTES,
   MAX_DETACHED_CHILDREN = MAX_DETACHED_CHILDREN,
   MAX_MESSAGE_FILES = MAX_MESSAGE_FILES,
   TRANSCRIPT_MAX_TAIL_BYTES = TRANSCRIPT_MAX_TAIL_BYTES,
+  resolveProfileRoot = resolveProfileRoot,
+  classifyErrorText = classifyErrorText,
+  readLastTranscriptError = readLastTranscriptError,
   decodeUtf8 = decodeUtf8,
   parseModelsOutput = parseModelsOutput,
   parseMcpListOutput = parseMcpListOutput,

@@ -614,15 +614,25 @@ local function buildAttachmentBlock(att)
   }
 end
 
-local function instructionCandidatePaths(workspace)
+local function instructionCandidatePaths(workspace, env)
   local roots = {}
   if type(workspace) == "string" and trim(workspace) ~= "" then
     local cleanWs = trim(workspace):gsub("[\\/]+$", "")
     roots[#roots + 1] = cleanWs
     roots[#roots + 1] = cleanWs .. "/.agents"
   end
-  roots[#roots + 1] = "~/.gemini"
-  roots[#roots + 1] = "~/.gemini/config"
+  local geminiHome = "~/.gemini"
+  if type(env) == "table" then
+    local home = trim(env.HOME)
+    if home == "" then
+      home = trim(env.USERPROFILE)
+    end
+    if home ~= "" then
+      geminiHome = home:gsub("[\\/]+$", "") .. "/.gemini"
+    end
+  end
+  roots[#roots + 1] = geminiHome
+  roots[#roots + 1] = geminiHome .. "/config"
   local paths = {}
   for _, root in ipairs(roots) do
     paths[#paths + 1] = root .. "/AGENTS.md"
@@ -1044,23 +1054,15 @@ function AcpTurn:handlePromptReply(rpcId, packet)
   end
 
   local reason = (type(final) == "table" and type(final.result) == "table") and final.result.stopReason or nil
-  if reason == "end_turn" then
+  if reason == "end_turn" or reason == "refusal" then
     self.promptSettled = true
-    self.settledReason = "end_turn"
+    self.settledReason = reason
     self.settledPacket = final
     self:_startSettleLoop()
     return
   end
   if reason == "cancelled" then
     self:finishCancelled()
-    return
-  end
-  if reason == "refusal" then
-    self:finishFailed(
-      self.trailingError or "Antigravity stopped the turn with refusal",
-      "execution",
-      false
-    )
     return
   end
   if reason == "max_tokens" or reason == "max_turn_requests" then
@@ -1107,18 +1109,28 @@ end
 function AcpTurn:_runSettleLoop(gen)
   local deferred = false
   local sawSubagents = false
-  local sawDetached = false
+
+  local function finishClassifiedError(classified)
+    if classified.sessionBroken then
+      self.session.broken = true
+      self.session:emitSessionExpired()
+      self:finishFailed(classified.message, "execution", true)
+    else
+      self:finishFailed(classified.message, "execution", false)
+    end
+  end
 
   local function settleStep()
     self._woken = false
     local reason = self.settledReason
+    local profileRoot = self.session.profileRoot
 
     local hasOpenTools = #self:outlivingToolIds() > 0
     local hasIncoming = next(self.session.incomingRequests) ~= nil
       or next(self.session.pendingApprovals) ~= nil
     local subagents = {}
     if next(self.subagentCalls) ~= nil then
-      subagents = state.activeSubagentCalls(self.session.providerSessionId, self.subagentCalls)
+      subagents = state.activeSubagentCalls(self.session.providerSessionId, self.subagentCalls, profileRoot)
     end
     if not self:_stillSettling(gen) then
       return false
@@ -1134,21 +1146,9 @@ function AcpTurn:_runSettleLoop(gen)
       end
     end
 
-    local hasDetached = (not self:hasLiveDaemonTool()) and self.session:hasDetachedChildren()
-    if not self:_stillSettling(gen) then
-      return false
-    end
-
-    if hasDetached then
-      sawDetached = true
-    elseif sawDetached then
-      sawDetached = false
-      if self._postWorkGraceDeadlineMs == nil then
-        self._postWorkGraceDeadlineMs = nowMs() + POST_WORK_WAKE_GRACE_MS
-      end
-    end
-
-    if hasOpenTools or hasIncoming or hasSubagents or hasDetached then
+    -- 0.3 parity (_settle_loop): NEVER block turn settlement on hasDetachedChildren().
+    -- Only outliving non-daemon tools, incoming permission requests, and active subagents defer settlement.
+    if hasOpenTools or hasIncoming or hasSubagents then
       deferred = true
       self._replyInactivityDeadlineMs = nil
       self:_waitOrWake(DEFERRED_POLL_MS)
@@ -1156,11 +1156,8 @@ function AcpTurn:_runSettleLoop(gen)
     end
 
     if reason == "refusal" then
-      self:finishFailed(
-        self.trailingError or "Antigravity stopped the turn with refusal",
-        "execution",
-        false
-      )
+      local rawErr = self.trailingError or "Antigravity stopped the turn with refusal"
+      finishClassifiedError(state.classifyErrorText(rawErr))
       return false
     end
 
@@ -1170,12 +1167,12 @@ function AcpTurn:_runSettleLoop(gen)
         self:_waitOrWake(self._quietDeadlineMs - now)
         return true
       end
-      self:finishFailed(self.trailingError, "execution", false)
+      finishClassifiedError(state.classifyErrorText(self.trailingError))
       return false
     end
 
     local now = nowMs()
-    local pendingReply = state.hasPendingReply(self.session.providerSessionId)
+    local pendingReply = state.hasPendingReply(self.session.providerSessionId, profileRoot)
     if not self:_stillSettling(gen) then
       return false
     end
@@ -1189,6 +1186,11 @@ function AcpTurn:_runSettleLoop(gen)
       if remaining > 0 then
         self:_waitOrWake(math.min(DEFERRED_POLL_MS, remaining))
         return true
+      end
+      local transcriptErr = state.readLastTranscriptError(self.session.providerSessionId, profileRoot)
+      if transcriptErr then
+        finishClassifiedError(transcriptErr)
+        return false
       end
       self:finishCompleted()
       return false
@@ -1216,6 +1218,11 @@ function AcpTurn:_runSettleLoop(gen)
 
     if self._woken then
       return true
+    end
+    local transcriptErr = state.readLastTranscriptError(self.session.providerSessionId, profileRoot)
+    if transcriptErr then
+      finishClassifiedError(transcriptErr)
+      return false
     end
     self:finishCompleted()
     return false
@@ -1363,13 +1370,15 @@ end
 local AcpSession = {}
 AcpSession.__index = AcpSession
 
-function AcpSession.new(localId, proc, emit, shutdownTimeoutMs)
+function AcpSession.new(localId, proc, emit, shutdownTimeoutMs, profileRoot, env)
   return setmetatable({
     localId = localId,
     providerSessionId = nil,
     proc = proc,
     emit = emit,
     shutdownTimeoutMs = shutdownTimeoutMs,
+    profileRoot = profileRoot or state.DEFAULT_PROFILE_ROOT,
+    env = env,
     model = "",
     seq = 0,
     usage = UsageAccumulator.new(),
@@ -1484,7 +1493,7 @@ function AcpSession:startReaders()
 end
 
 function AcpSession:startInstructionWatcher(workspace)
-  self._watchPaths = instructionCandidatePaths(workspace)
+  self._watchPaths = instructionCandidatePaths(workspace, self.env)
   if #self._watchPaths == 0 or not (fs and type(fs.stat) == "function") then
     return
   end
@@ -2130,7 +2139,8 @@ local function openSession(_ctx, config, input, emit)
     cwd = type(inp.workspace) == "string" and inp.workspace or "",
     env = env,
   })
-  local sess = AcpSession.new(localId, proc, emit, shutdownTimeoutMs)
+  local profileRoot = state.resolveProfileRoot(env)
+  local sess = AcpSession.new(localId, proc, emit, shutdownTimeoutMs, profileRoot, env)
   sess:startReaders()
 
   local ok, result = pcall(function()
@@ -2230,14 +2240,17 @@ local function openSession(_ctx, config, input, emit)
     emit({
       type = "session_started",
       sessionId = localId,
+      providerThreadId = sess.providerSessionId,
       model = sess.model,
       metadata = {
+        providerThreadId = sess.providerSessionId,
         providerSessionId = sess.providerSessionId,
         availableModels = optionChoices(configured, "model"),
       },
     })
     return {
       sessionId = localId,
+      providerThreadId = sess.providerSessionId,
       model = sess.model,
     }
   end)
@@ -2314,7 +2327,9 @@ local function startTurn(sessionId, input)
   end)
 
   sess.startingTurn = false
-  if turn and sess.activeTurn == turn then
+  -- 0.3 parity (runtime.py:264-266,723-729): retain completed turn on sess.activeTurn so
+  -- post-turn permission requests from background daemons/subagents are still accepted.
+  if turn and sess.activeTurn == turn and (not turn.completed or sess.closed) then
     sess.activeTurn = nil
   end
   if not ok then
@@ -2413,7 +2428,7 @@ local function hasBackgroundJob(sessionId)
   if sess:hasDetachedChildren() then
     return true
   end
-  return state.hasLiveDiskBackgroundWork(sess.providerSessionId, sess.subagentCalls)
+  return state.hasLiveDiskBackgroundWork(sess.providerSessionId, sess.subagentCalls, sess.profileRoot)
 end
 
 closeSession = function(sessionId)
