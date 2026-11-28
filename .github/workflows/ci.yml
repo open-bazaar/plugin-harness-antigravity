@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Install bcn
+        env:
+          GOPRIVATE: github.com/yuchanns/bazaar-compute-node
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" go install -ldflags "-X main.HostVersion=0.4.0-rc.1" github.com/yuchanns/bazaar-compute-node/cmd/bcn@0.4
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/bcn" --version
+      - name: Vet & Test (offline)
+        working-directory: tests
+        run: |
+          go vet ./...
+          go test -v -timeout 5m -count=1 -run TestOffline ./...
+
+  e2e:
+    name: E2E (${{ matrix.scenario }})
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - mcp-once
+          - bcc
+          - full-access
+          - recovery
+          - refresh
+          - background
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Install Antigravity CLI
+        run: |
+          archive="$RUNNER_TEMP/cli_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location -o "$archive" \
+            https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.13-5999302598852608/linux-x64/cli_linux_x64.tar.gz
+          printf '%s  %s\n' '014b37387703acab1f47cd532c8bb60167a6a3537b0f9891de03f1b1ffa9614307bc83c4b2f7551273b0877d722716b0cd9e26782f6b2a50705db4f05e18c68f' "$archive" | sha512sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" antigravity
+          mv "$RUNNER_TEMP/antigravity" "$RUNNER_TEMP/agy"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/agy" --version
+      - name: Sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install bcn
+        env:
+          GOPRIVATE: github.com/yuchanns/bazaar-compute-node
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" go install -ldflags "-X main.HostVersion=0.4.0-rc.1" github.com/yuchanns/bazaar-compute-node/cmd/bcn@0.4
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/bcn" --version
+      - name: Gateway
+        uses: yuchanns/setup-ai-gateway@564af746413273335294b725ff195acde1501f3d
+        id: gateway
+        with:
+          context-size: '131072'
+      - name: Route Antigravity's Gemini model through Magpie
+        env:
+          GATEWAY_MODEL: ${{ steps.gateway.outputs.model }}
+        run: |
+          gateway=$(docker ps --filter 'label=com.docker.compose.service=magpie' --filter "publish=${AI_GATEWAY_BASE_URL##*:}" --quiet)
+          docker exec "$gateway" magpie group add gemini-3.8-flash "models=$GATEWAY_MODEL"
+      - name: Run Live Antigravity E2E
+        working-directory: tests
+        env:
+          BCN_REQUIRE_LIVE_E2E: '1'
+          BCN_E2E_SCENARIO: ${{ matrix.scenario }}
+          BCN_E2E_MODEL: gemini-3.8-flash
+          BCN_E2E_ARTIFACTS: ${{ github.workspace }}/.artifacts/e2e
+        run: |
+          mkdir -p "$BCN_E2E_ARTIFACTS"
+          go test -v -timeout 30m -count=1 -run TestLiveAntigravityE2E ./...
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: antigravity-e2e-${{ matrix.scenario }}
+          path: |
+            .artifacts/e2e/**/*.log
+            .artifacts/e2e/**/*.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
